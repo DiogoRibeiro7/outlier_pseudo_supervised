@@ -141,8 +141,9 @@ class PSOD:
         :param target_col: Target column for correlation computation.
         :return: List of columns with correlation above threshold.
         """
+        numerical_cols = df.select_dtypes(include=[np.number]).columns
         return [
-            col for col in df.columns 
+            col for col in numerical_cols
             if col != target_col and abs(df[col].corr(df[target_col])) > self.correlation_threshold
         ]
 
@@ -262,11 +263,19 @@ class PSOD:
             if isinstance(self.cat_columns, list):
                 enc = self.cat_encoder(cols=chosen_cat_cols)
                 enc.fit(temp_df.loc[idx, chosen_cat_cols], temp_df.loc[idx, col]) if self.cat_encode_on_sample else enc.fit(temp_df[chosen_cat_cols], temp_df[col])
-                temp_df[chosen_cat_cols] = enc.transform(temp_df[chosen_cat_cols], temp_df[col])
+                transformed_cat_cols = enc.transform(temp_df[chosen_cat_cols], temp_df[col])
+                temp_df = temp_df.drop(columns=chosen_cat_cols).reset_index(drop=True)
+                temp_df = pd.concat([temp_df, transformed_cat_cols.reset_index(drop=True)], axis=1)
             
-            reg = self.base_learner(n_jobs=self.n_jobs).fit(temp_df.loc[idx, self.chosen_columns[col]], temp_df.loc[idx, col])
-            df_scores[col] = reg.predict(temp_df[self.chosen_columns[col]])
-            df_scores[col] = abs(temp_df[col] - df_scores[col])
+            if 'n_jobs' in self.base_learner().get_params().keys():
+                reg = self.base_learner(n_jobs=self.n_jobs).fit(temp_df.loc[idx, self.chosen_columns[col]], temp_df.loc[idx, col])
+            else:
+                reg = self.base_learner().fit(temp_df.loc[idx, self.chosen_columns[col]], temp_df.loc[idx, col])
+            predictions = reg.predict(temp_df[self.chosen_columns[col]])
+            prediction_error = abs(temp_df[col] - predictions)
+            overall_error = prediction_error.mean()
+            df_scores[col] = prediction_error / overall_error  # Apply regularization by weighting prediction error
+
             self.regressors[col] = reg
             if isinstance(self.cat_columns, list):
                 self.cat_encoders[col] = enc
@@ -287,8 +296,6 @@ class PSOD:
         :param use_trained_stats: Use mean and std of prediction errors from training if True.
         :return: Outlier predictions as a Pandas Series.
         """
-        from sklearn.ensemble import RandomForestRegressor  # Import the appropriate class
-
         df = df.loc[:, self.cols_with_var + (self.cat_columns if isinstance(self.cat_columns, list) else [])]
         df_scores = df.copy()
 
@@ -299,9 +306,58 @@ class PSOD:
             temp_df = df.copy()
             chosen_cat_cols = self.col_intersection(self.cat_columns, self.chosen_columns[col]) if isinstance(self.cat_columns, list) else self.chosen_columns[col]
             if isinstance(self.cat_columns, list):
-                temp_df[chosen_cat_cols] = self.cat_encoders[col].transform(temp_df[chosen_cat_cols])
-            df_scores[col] = self.regressors[col].predict(temp_df[self.chosen_columns[col]])
-            df_scores[col] = abs(temp_df[col] - df_scores[col])
+                transformed_cat_cols = self.cat_encoders[col].transform(temp_df[chosen_cat_cols])
+                temp_df = temp_df.drop(columns=chosen_cat_cols).reset_index(drop=True)
+                temp_df = pd.concat([temp_df, transformed_cat_cols.reset_index(drop=True)], axis=1)
+            predictions = self.regressors[col].predict(temp_df[self.chosen_columns[col]])
+            prediction_error = abs(temp_df[col] - predictions)
+            overall_error = prediction_error.mean()
+            df_scores[col] = prediction_error / overall_error  # Apply regularization by weighting prediction error
 
         df_scores = self.drop_cat_columns(df_scores)
         return self.make_outlier_classes(df_scores, use_trained_stats=use_trained_stats) if return_class else df_scores["anomaly"]
+
+
+import pandas as pd
+from sklearn.linear_model import Ridge
+from category_encoders import OneHotEncoder
+
+# Sample data creation
+data = {
+    'A': [1, 2, 3, 4, 5, 100],
+    'B': [10, 20, 30, 40, 50, 1000],
+    'C': ['cat', 'dog', 'cat', 'dog', 'cat', 'dog']
+}
+df = pd.DataFrame(data)
+
+# Initialize PSOD with Ridge regression as the base learner and OneHotEncoder for categorical encoding
+psod = PSOD(
+    n_jobs=1,
+    cat_columns=['C'],
+    min_cols_chosen=0.5,
+    max_cols_chosen=1.0,
+    stdevs_to_outlier=1.96,
+    sample_frac=1.0,
+    correlation_threshold=0.05,
+    transform_algorithm='logarithmic',
+    random_seed=42,
+    cat_encode_on_sample=False,
+    flag_outlier_on='both ends',
+    base_learner=Ridge,
+    cat_encoder=OneHotEncoder
+)
+
+# Fit and predict outliers
+outlier_scores = psod.fit_predict(df)
+print(outlier_scores)
+
+# Predict outliers on new data
+new_data = {
+    'A': [2, 3, 4, 50],
+    'B': [15, 25, 35, 500],
+    'C': ['cat', 'dog', 'cat', 'dog']
+}
+new_df = pd.DataFrame(new_data)
+
+outlier_scores_new = psod.predict(new_df)
+print(outlier_scores_new)
