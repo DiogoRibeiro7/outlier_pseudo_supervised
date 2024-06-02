@@ -1,19 +1,20 @@
-from typing import List, Union, Dict
+from typing import List, Union, Dict, Type
 import warnings
 import pandas as pd
 import numpy as np
+from sklearn.base import RegressorMixin
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import PowerTransformer
 from tqdm import tqdm
-from category_encoders import TargetEncoder
 import gc
+from category_encoders import BaseNEncoder, TargetEncoder
 
 
 class PSOD:
     """
     Get outlier predictions using a pseudo-supervised approach.
 
-    :param n_jobs: Number of cores used for LinearRegression. Default is -1 (all cores).
+    :param n_jobs: Number of cores used for the regressor. Default is -1 (all cores).
     :param cat_columns: List specifying column names of categorical features. None if no categorical features.
     :param min_cols_chosen: Minimum percentage of columns to be used for each regressor.
     :param max_cols_chosen: Maximum percentage of columns to be used for each regressor.
@@ -24,6 +25,8 @@ class PSOD:
     :param random_seed: Initial random seed. Each additional iteration will use a different seed.
     :param cat_encode_on_sample: Apply categorical encoding to bagging sample if True; otherwise, use the full dataset.
     :param flag_outlier_on: Specify whether to flag errors on the "low end", "both ends", or "high end" of the mean error distribution.
+    :param base_learner: A regressor class to be used as the base learner for predictions.
+    :param cat_encoder: A categorical encoder class from category_encoders to be used for encoding categorical features.
     """
     def __init__(
         self,
@@ -37,12 +40,14 @@ class PSOD:
         transform_algorithm: Union[str, None] = "logarithmic",
         random_seed: int = 1,
         cat_encode_on_sample: bool = False,
-        flag_outlier_on: str = "both ends"
+        flag_outlier_on: str = "both ends",
+        base_learner: Type[RegressorMixin] = LinearRegression,
+        cat_encoder: Type[BaseNEncoder] = TargetEncoder
     ):
         self.cat_columns = cat_columns
-        self.cat_encoders: Dict[str, TargetEncoder] = {}
+        self.cat_encoders: Dict[str, BaseNEncoder] = {}
         self.numeric_encoders: Union[PowerTransformer, None] = None
-        self.regressors: Dict[str, LinearRegression] = {}
+        self.regressors: Dict[str, RegressorMixin] = {}
         self.n_jobs = n_jobs
         self.scores: Union[pd.Series, None] = None
         self.outlier_classes: Union[pd.Series, None] = None
@@ -59,6 +64,8 @@ class PSOD:
         self.cat_encode_on_sample = cat_encode_on_sample
         self.random_generator = np.random.default_rng(self.random_seed)
         self.pred_distribution_stats: Dict[str, float] = {}
+        self.base_learner = base_learner
+        self.cat_encoder = cat_encoder
 
         # Validate parameters
         self._validate_params()
@@ -104,6 +111,8 @@ class PSOD:
         - random_seed: {self.random_seed}
         - cat_encode_on_sample: {self.cat_encode_on_sample}
         - flag_outlier_on: {self.flag_outlier_on}
+        - base_learner: {self.base_learner.__name__}
+        - cat_encoder: {self.cat_encoder.__name__}
         """
 
     def get_range_cols(self, df: pd.DataFrame):
@@ -186,4 +195,113 @@ class PSOD:
         """
         if self.transform_algorithm == "logarithmic":
             return np.log1p(df)
-        elif self.transform_algorithm == "
+        elif self.transform_algorithm == "yeo-johnson":
+            scaler = PowerTransformer(method="yeo-johnson")
+            df_transformed = scaler.fit_transform(df)
+            self.numeric_encoders = scaler
+            return pd.DataFrame(df_transformed, columns=df.columns)
+        return df
+
+    def transform_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform numeric data based on the fitted transformation algorithm.
+
+        :param df: DataFrame to transform.
+        :return: Transformed DataFrame.
+        """
+        if self.transform_algorithm == "logarithmic":
+            return np.log1p(df)
+        elif self.transform_algorithm == "yeo-johnson" and self.numeric_encoders:
+            df_transformed = self.numeric_encoders.transform(df)
+            return pd.DataFrame(df_transformed, columns=df.columns)
+        return df
+
+    def remove_zero_variance(self, df: pd.DataFrame) -> List[str]:
+        """
+        Remove columns with zero variance.
+
+        :param df: DataFrame to check for zero variance.
+        :return: List of columns with non-zero variance.
+        """
+        var_data = df.var()
+        return var_data[var_data != 0].index.to_list()
+
+    def fit_predict(self, df: pd.DataFrame, return_class: bool = False) -> pd.Series:
+        """
+        Train PSOD and return outlier predictions.
+
+        :param df: DataFrame to detect outliers from.
+        :param return_class: Return class labels if True, else return outlier scores.
+        :return: Outlier predictions as a Pandas Series.
+        """
+        if isinstance(self.cat_columns, list):
+            self.cols_with_var = self.remove_zero_variance(df.drop(self.cat_columns, axis=1))
+            df = df.loc[:, self.cols_with_var + self.cat_columns]
+        else:
+            self.cols_with_var = self.remove_zero_variance(df)
+            df = df.loc[:, self.cols_with_var]
+
+        df_scores = df.copy()
+        self.get_range_cols(df)
+        if isinstance(self.cat_columns, list):
+            loop_cols = df.drop(self.cat_columns, axis=1).columns
+            df[loop_cols] = self.fit_transform_numeric_data(df[loop_cols])
+        else:
+            loop_cols = df.columns
+            df = self.fit_transform_numeric_data(df)
+
+        for enum, col in tqdm(enumerate(loop_cols), total=len(loop_cols)):
+            self.chosen_columns[col] = self.chose_random_columns(df.drop(columns=[col]))
+            temp_df = df.copy()
+            chosen_cat_cols = self.col_intersection(self.cat_columns, self.chosen_columns[col]) if isinstance(self.cat_columns, list) else self.chosen_columns[col]
+            corr_cols = self.correlation_feature_selection(temp_df, col)
+            corr_cols = self.col_intersection(corr_cols, self.chosen_columns[col])
+            self.chosen_columns[col] = corr_cols if corr_cols else self.chosen_columns[col]
+            idx = df_scores.sample(frac=self.sample_frac, random_state=enum, replace=True).index
+
+            if isinstance(self.cat_columns, list):
+                enc = self.cat_encoder(cols=chosen_cat_cols)
+                enc.fit(temp_df.loc[idx, chosen_cat_cols], temp_df.loc[idx, col]) if self.cat_encode_on_sample else enc.fit(temp_df[chosen_cat_cols], temp_df[col])
+                temp_df[chosen_cat_cols] = enc.transform(temp_df[chosen_cat_cols], temp_df[col])
+            
+            reg = self.base_learner(n_jobs=self.n_jobs).fit(temp_df.loc[idx, self.chosen_columns[col]], temp_df.loc[idx, col])
+            df_scores[col] = reg.predict(temp_df[self.chosen_columns[col]])
+            df_scores[col] = abs(temp_df[col] - df_scores[col])
+            self.regressors[col] = reg
+            if isinstance(self.cat_columns, list):
+                self.cat_encoders[col] = enc
+                del enc
+
+            del temp_df, idx, reg
+            gc.collect()
+
+        df_scores = self.drop_cat_columns(df_scores)
+        return self.make_outlier_classes(df_scores, use_trained_stats=False) if return_class else df_scores["anomaly"]
+
+    def predict(self, df: pd.DataFrame, return_class: bool = False, use_trained_stats: bool = True) -> pd.Series:
+        """
+        Predict outliers using a trained PSOD instance on new data.
+
+        :param df: DataFrame to predict outliers from.
+        :param return_class: Return class labels if True, else return outlier scores.
+        :param use_trained_stats: Use mean and std of prediction errors from training if True.
+        :return: Outlier predictions as a Pandas Series.
+        """
+        from sklearn.ensemble import RandomForestRegressor  # Import the appropriate class
+
+        df = df.loc[:, self.cols_with_var + (self.cat_columns if isinstance(self.cat_columns, list) else [])]
+        df_scores = df.copy()
+
+        loop_cols = df.drop(columns=self.cat_columns).columns if isinstance(self.cat_columns, list) else df.columns
+        df[loop_cols] = self.transform_numeric_data(df[loop_cols])
+
+        for enum, col in tqdm(enumerate(loop_cols)):
+            temp_df = df.copy()
+            chosen_cat_cols = self.col_intersection(self.cat_columns, self.chosen_columns[col]) if isinstance(self.cat_columns, list) else self.chosen_columns[col]
+            if isinstance(self.cat_columns, list):
+                temp_df[chosen_cat_cols] = self.cat_encoders[col].transform(temp_df[chosen_cat_cols])
+            df_scores[col] = self.regressors[col].predict(temp_df[self.chosen_columns[col]])
+            df_scores[col] = abs(temp_df[col] - df_scores[col])
+
+        df_scores = self.drop_cat_columns(df_scores)
+        return self.make_outlier_classes(df_scores, use_trained_stats=use_trained_stats) if return_class else df_scores["anomaly"]
