@@ -18,11 +18,11 @@ import pandas as pd
 from category_encoders import BaseNEncoder, TargetEncoder
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.feature_selection import mutual_info_regression
-from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import PowerTransformer, QuantileTransformer
 
+from ._imputation import Imputer, handle_missing_values
 from ._input import convert_datetime_columns, to_dataframe, validate_input
 
 logger = logging.getLogger(__name__)
@@ -159,7 +159,7 @@ class PSOD(BaseEstimator):
         self.n_features_in_: Optional[int] = None
 
         # Store imputer for missing values
-        self.imputer_: Optional[Union[SimpleImputer, KNNImputer]] = None
+        self.imputer_: Optional[Imputer] = None
         self.missing_value_indices_: Optional[pd.Index] = None
 
         # Validate parameters
@@ -579,98 +579,15 @@ class PSOD(BaseEstimator):
         )
 
     def _handle_missing_values(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:
-        """
-        Handle missing values according to the specified strategy.
-
-        Parameters
-        ----------
-        df : pd.DataFrame
-            DataFrame potentially containing missing values.
-        is_training : bool, default=True
-            Whether this is being called during training (fit) or prediction.
-
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame with missing values handled.
-        """
-        if self.missing_value_strategy is None:
-            return df
-
-        # Treat infinite values as missing (numeric columns only)
-        numeric_cols_all = df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols_all) > 0:
-            df = df.copy()
-            df[numeric_cols_all] = df[numeric_cols_all].replace([np.inf, -np.inf], np.nan)
-
-        # Check if there are any missing values
-        if not df.isnull().any().any():
-            logger.debug("No missing values detected.")
-            return df
-
-        missing_count = df.isnull().sum().sum()
-        logger.info(
-            f"Handling {missing_count} missing values using strategy: {self.missing_value_strategy}"
+        """Handle missing values and retain the fitted numeric imputer."""
+        result, self.imputer_ = handle_missing_values(
+            df,
+            strategy=self.missing_value_strategy,
+            is_training=is_training,
+            cat_columns=self.cat_columns,
+            imputer=self.imputer_,
         )
-
-        if self.missing_value_strategy == "drop":
-            # Drop rows with missing values
-            df_clean = df.dropna()
-            dropped_count = len(df) - len(df_clean)
-            if dropped_count > 0:
-                logger.warning(
-                    f"Dropped {dropped_count} rows ({dropped_count/len(df)*100:.2f}%) due to missing values."
-                )
-            return df_clean
-
-        # Separate numeric and categorical columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if self.cat_columns:
-            categorical_cols = [col for col in self.cat_columns if col in df.columns]
-            numeric_cols = [col for col in numeric_cols if col not in categorical_cols]
-        else:
-            categorical_cols = []
-
-        df_imputed = df.copy()
-
-        # Handle numeric columns
-        if numeric_cols and df[numeric_cols].isnull().any().any():
-            if is_training:
-                if self.missing_value_strategy == "mean":
-                    self.imputer_ = SimpleImputer(strategy="mean")
-                elif self.missing_value_strategy == "median":
-                    self.imputer_ = SimpleImputer(strategy="median")
-                elif self.missing_value_strategy == "mode":
-                    self.imputer_ = SimpleImputer(strategy="most_frequent")
-                elif self.missing_value_strategy == "knn":
-                    self.imputer_ = KNNImputer(n_neighbors=5)
-
-                df_imputed[numeric_cols] = self.imputer_.fit_transform(df[numeric_cols])  # type: ignore[union-attr]
-            else:
-                if self.imputer_ is not None:
-                    df_imputed[numeric_cols] = self.imputer_.transform(df[numeric_cols])
-                else:
-                    logger.warning("Imputer not fitted during training. Using mean imputation.")
-                    imputer = SimpleImputer(strategy="mean")
-                    df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
-
-        # Handle categorical columns (use mode)
-        if categorical_cols:
-            for col in categorical_cols:
-                if df_imputed[col].isnull().any():
-                    mode_value = (
-                        df_imputed[col].mode()[0]
-                        if not df_imputed[col].mode().empty
-                        else df_imputed[col].iloc[0]
-                    )
-                    df_imputed[col].fillna(mode_value, inplace=True)
-                    logger.debug(f"Filled missing values in {col} with mode: {mode_value}")
-
-        logger.info(
-            f"Successfully handled missing values. Remaining missing: {df_imputed.isnull().sum().sum()}"
-        )
-
-        return df_imputed
+        return result
 
     def _calculate_feature_importances(self) -> None:
         """Calculate and store feature importances."""
