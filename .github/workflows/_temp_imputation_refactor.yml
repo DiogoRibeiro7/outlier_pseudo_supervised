@@ -1,0 +1,60 @@
+name: Temporary Imputation Boundary Refactor
+
+on:
+  push:
+    branches:
+      - refactor/03d-imputation-boundary
+
+permissions:
+  contents: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refactor/03d-imputation-boundary
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Apply surgical imputation delegate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/psod/core.py")
+          text = path.read_text()
+
+          text = text.replace(
+              "from sklearn.impute import KNNImputer, SimpleImputer\n",
+              "",
+              1,
+          )
+          input_import = "from ._input import convert_datetime_columns, to_dataframe, validate_input\n"
+          imputation_import = "from ._imputation import Imputer, handle_missing_values\n"
+          if imputation_import not in text:
+              text = text.replace(input_import, imputation_import + input_import, 1)
+
+          text = text.replace(
+              "self.imputer_: Optional[Union[SimpleImputer, KNNImputer]] = None",
+              "self.imputer_: Optional[Imputer] = None",
+              1,
+          )
+
+          start = text.index("    def _handle_missing_values(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:\n")
+          end = text.index("    def _calculate_feature_importances", start)
+          new_block = '''    def _handle_missing_values(self, df: pd.DataFrame, is_training: bool = True) -> pd.DataFrame:\n        \"\"\"Handle missing values and retain the fitted numeric imputer.\"\"\"\n        result, self.imputer_ = handle_missing_values(\n            df,\n            strategy=self.missing_value_strategy,\n            is_training=is_training,\n            cat_columns=self.cat_columns,\n            imputer=self.imputer_,\n        )\n        return result\n\n'''
+          text = text[:start] + new_block + text[end:]
+          path.write_text(text)
+          PY
+      - run: python -m pip install black==26.5.1 isort==9.0.1
+      - run: isort src/psod/core.py src/psod/_imputation.py
+      - run: black src/psod/core.py src/psod/_imputation.py
+      - name: Commit refactor
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/psod/core.py src/psod/_imputation.py
+          git commit -m "refactor: delegate stateful imputation" || exit 0
+          git push origin HEAD:refactor/03d-imputation-boundary
