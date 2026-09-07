@@ -56,7 +56,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
-    "pytest-timeout>=2.1.0",
+    "pytest-timeout>=2.4.0",
     "pytest-mock>=3.10.0",
     "black>=23.0.0",
     "isort>=5.12.0",
@@ -78,7 +78,7 @@ test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
-    "pytest-timeout>=2.1.0",
+    "pytest-timeout>=2.4.0",
     "pytest-mock>=3.10.0",
     "hypothesis>=6.75.0",
 ]
